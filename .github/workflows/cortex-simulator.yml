@@ -1,0 +1,130 @@
+# cortex-simulator v1 serve-sim=0.1.47
+# Made by Cortex. Opens an iPhone simulator with one of your test builds and streams it to Cortex.
+name: Cortex Simulator
+run-name: Cortex iPhone simulator for build ${{ inputs.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: The Cortex Build run whose iPhone test build to open
+        required: true
+      key_hash:
+        description: SHA-256 of the session key Cortex holds
+        required: true
+      minutes:
+        description: How long to keep the simulator open
+        default: "20"
+
+jobs:
+  simulator:
+    runs-on: macos-latest
+    timeout-minutes: 75
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-debug
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: app
+      - name: Start the simulator with the app
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for k in sorted(d, reverse=True) if "iOS" in k for x in d[k] if x["name"].startswith("iPhone")))')
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          APP=$(ls -d app/*.app | head -1)
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch "$UDID" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+      - name: Stream it to Cortex
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CORTEX_KEY_HASH: ${{ inputs.key_hash }}
+        run: |
+          case "$CORTEX_KEY_HASH" in *[!0-9a-f]*|"") echo "::error::bad key_hash"; exit 1;; esac
+          brew install cloudflared >/dev/null
+          nohup npx -y serve-sim@0.1.47 --codec mjpeg > "$RUNNER_TEMP/sim.log" 2>&1 &
+          for i in $(seq 1 90); do curl -sf http://127.0.0.1:3200 >/dev/null && break; sleep 2; done
+          cat > "$RUNNER_TEMP/proxy.js" <<'JS'
+          const http = require("http");
+          const net = require("net");
+          const crypto = require("crypto");
+          const HASH = process.env.CORTEX_KEY_HASH;
+          const UDID = process.env.UDID;
+          const TARGET = Number(process.env.SIM_PORT || 3200);
+          const sha = (s) => crypto.createHash("sha256").update(s).digest("hex");
+          function check(rawUrl) {
+            const u = new URL(rawUrl, "http://proxy");
+            const key = u.searchParams.get("k") || "";
+            const okKey = key.length > 0 && crypto.timingSafeEqual(Buffer.from(sha(key)), Buffer.from(HASH));
+            const okPath = u.pathname === "/cortex/info" || u.pathname.startsWith("/helper/" + UDID + "/");
+            u.searchParams.delete("k");
+            return { ok: okKey && okPath, u };
+          }
+          function forwardHeaders(raw) {
+            const out = {};
+            for (let i = 0; i < raw.length; i += 2) {
+              const name = raw[i].toLowerCase();
+              if (name !== "origin" && name !== "host" && name !== "referer") out[raw[i]] = raw[i + 1];
+            }
+            out.Host = "127.0.0.1:" + TARGET;
+            return out;
+          }
+          const cors = { "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" };
+          const server = http.createServer((req, res) => {
+            const { ok, u } = check(req.url);
+            if (!ok) { res.writeHead(403, cors); res.end("forbidden"); return; }
+            if (u.pathname === "/cortex/info") {
+              res.writeHead(200, { ...cors, "Content-Type": "application/json" });
+              res.end(JSON.stringify({ udid: UDID }));
+              return;
+            }
+            const up = http.request(
+              { host: "127.0.0.1", port: TARGET, method: req.method, path: u.pathname + u.search, headers: forwardHeaders(req.rawHeaders) },
+              (r) => { res.writeHead(r.statusCode, { ...r.headers, ...cors }); r.pipe(res); }
+            );
+            up.on("error", () => { if (!res.headersSent) res.writeHead(502, cors); res.end(); });
+            req.pipe(up);
+          });
+          server.on("upgrade", (req, sock, head) => {
+            const { ok, u } = check(req.url);
+            if (!ok) { sock.end("HTTP/1.1 403 Forbidden\r\n\r\n"); return; }
+            const up = net.connect(TARGET, "127.0.0.1", () => {
+              const h = forwardHeaders(req.rawHeaders);
+              const lines = [req.method + " " + u.pathname + u.search + " HTTP/1.1"];
+              for (const name of Object.keys(h)) lines.push(name + ": " + h[name]);
+              up.write(lines.join("\r\n") + "\r\n\r\n");
+              up.write(head);
+              sock.pipe(up).pipe(sock);
+            });
+            up.on("error", () => sock.destroy());
+            sock.on("error", () => up.destroy());
+          });
+          server.listen(Number(process.env.PROXY_PORT || 3300), "127.0.0.1");
+          JS
+          nohup node "$RUNNER_TEMP/proxy.js" > "$RUNNER_TEMP/proxy.log" 2>&1 &
+          nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:3300 > "$RUNNER_TEMP/cf.log" 2>&1 &
+          for i in $(seq 1 45); do URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$RUNNER_TEMP/cf.log" | head -1); [ -n "$URL" ] && break; sleep 2; done
+          [ -n "$URL" ] || { cat "$RUNNER_TEMP/cf.log"; echo "::error::The tunnel did not start"; exit 1; }
+          # Cortex reads the link from this status; it is useless without the key Cortex holds.
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=pending -f context="cortex/simulator/$GITHUB_RUN_ID" \
+            -f target_url="$URL" -f description="iPhone simulator is open" >/dev/null
+      - name: Keep it open
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          case "$MINUTES" in ""|*[!0-9]*) MINUTES=20;; esac
+          [ "$MINUTES" -gt 60 ] && MINUTES=60
+          sleep $(( MINUTES * 60 ))
+      - name: Close
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=success -f context="cortex/simulator/$GITHUB_RUN_ID" \
+            -f description="iPhone simulator closed" >/dev/null || true
+          cat "$RUNNER_TEMP/sim.log" 2>/dev/null | tail -n 40 || true
