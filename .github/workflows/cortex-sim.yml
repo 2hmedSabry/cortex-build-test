@@ -1,0 +1,48 @@
+name: Cortex Simulator
+run-name: Cortex simulator for build ${{ inputs.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: The Cortex Build run whose iPhone test build to open
+        required: true
+      minutes:
+        description: How long to keep the simulator open
+        default: "15"
+
+jobs:
+  simulator:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-debug
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: app
+      - name: Start the simulator with the app
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for k in sorted(d, reverse=True) if "iOS" in k for x in d[k] if x["name"].startswith("iPhone")))')
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          APP=$(ls -d app/*.app | head -1)
+          xcrun simctl install "$UDID" "$APP"
+          xcrun simctl launch "$UDID" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+      - name: Share the screen
+        run: |
+          brew install cloudflared >/dev/null
+          nohup npx -y serve-sim > "$RUNNER_TEMP/sim.log" 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://localhost:3200 >/dev/null && break; sleep 2; done
+          nohup cloudflared tunnel --no-autoupdate --url http://localhost:3200 > "$RUNNER_TEMP/cf.log" 2>&1 &
+          for i in $(seq 1 30); do URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$RUNNER_TEMP/cf.log" | head -1); [ -n "$URL" ] && break; sleep 2; done
+          echo "CORTEX_SIMULATOR_URL=$URL"
+          echo "Simulator: $URL" >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/sim.log"
+      - name: Keep it open
+        run: sleep $(( ${{ inputs.minutes }} * 60 ))
