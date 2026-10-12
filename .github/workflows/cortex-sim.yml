@@ -18,6 +18,7 @@ jobs:
     permissions:
       actions: read
       contents: read
+      statuses: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -35,6 +36,8 @@ jobs:
           xcrun simctl install "$UDID" "$APP"
           xcrun simctl launch "$UDID" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
       - name: Share the screen
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           brew install cloudflared >/dev/null
           nohup npx -y serve-sim > "$RUNNER_TEMP/sim.log" 2>&1 &
@@ -43,6 +46,9 @@ jobs:
           for i in $(seq 1 30); do URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$RUNNER_TEMP/cf.log" | head -1); [ -n "$URL" ] && break; sleep 2; done
           echo "::notice title=Cortex simulator::$URL"
           echo "Simulator: $URL" >> "$GITHUB_STEP_SUMMARY"
+          # Cortex reads the link from this commit status while the session is open.
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=pending -f context=cortex/simulator \
+            -f target_url="$URL" -f description="iPhone simulator is open" >/dev/null
           cat "$RUNNER_TEMP/sim.log"
       - name: Keep it open
         run: sleep $(( ${{ inputs.minutes }} * 60 ))
