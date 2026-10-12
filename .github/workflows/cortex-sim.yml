@@ -51,4 +51,6 @@ jobs:
             -f target_url="$URL" -f description="iPhone simulator is open" >/dev/null
           cat "$RUNNER_TEMP/sim.log"
       - name: Keep it open
-        run: sleep $(( ${{ inputs.minutes }} * 60 ))
+        run: |
+          sleep $(( ${{ inputs.minutes }} * 60 ))
+          echo "--- serve-sim log ---"; cat "$RUNNER_TEMP/sim.log"
