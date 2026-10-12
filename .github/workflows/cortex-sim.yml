@@ -40,7 +40,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           brew install cloudflared >/dev/null
-          nohup npx -y serve-sim > "$RUNNER_TEMP/sim.log" 2>&1 &
+          nohup npx -y serve-sim --codec mjpeg > "$RUNNER_TEMP/sim.log" 2>&1 &
           for i in $(seq 1 60); do curl -sf http://localhost:3200 >/dev/null && break; sleep 2; done
           nohup cloudflared tunnel --no-autoupdate --url http://localhost:3200 > "$RUNNER_TEMP/cf.log" 2>&1 &
           for i in $(seq 1 30); do URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$RUNNER_TEMP/cf.log" | head -1); [ -n "$URL" ] && break; sleep 2; done
