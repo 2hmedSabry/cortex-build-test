@@ -1,4 +1,4 @@
-# cortex-simulator v1 serve-sim=0.1.47
+# cortex-simulator v2 serve-sim=0.1.47
 # Made by Cortex. Opens an iPhone simulator with one of your test builds and streams it to Cortex.
 name: Cortex Simulator
 run-name: Cortex iPhone simulator for build ${{ inputs.run_id }}
@@ -85,7 +85,13 @@ jobs:
             }
             const up = http.request(
               { host: "127.0.0.1", port: TARGET, method: req.method, path: u.pathname + u.search, headers: forwardHeaders(req.rawHeaders) },
-              (r) => { res.writeHead(r.statusCode, { ...r.headers, ...cors }); r.pipe(res); }
+              (r) => {
+                // serve-sim sends its own CORS headers; replace them so there is one of each.
+                const h = {};
+                for (const name of Object.keys(r.headers)) if (!name.startsWith("access-control-")) h[name] = r.headers[name];
+                res.writeHead(r.statusCode, { ...h, ...cors });
+                r.pipe(res);
+              }
             );
             up.on("error", () => { if (!res.headersSent) res.writeHead(502, cors); res.end(); });
             req.pipe(up);
