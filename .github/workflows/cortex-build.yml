@@ -1,4 +1,4 @@
-# cortex-build v2 stack=expo dir=.
+# cortex-build v3 stack=expo dir=.
 # Made by Cortex. Builds run on your GitHub account; Cortex starts them and downloads the results.
 name: Cortex Build
 run-name: Cortex ${{ inputs.platform }} ${{ inputs.profile }} build
@@ -58,7 +58,7 @@ jobs:
             find . -maxdepth 2 -name 'build.gradle*' -exec sed -i -E "s/versionCode( =)? [0-9]+/versionCode\1 $BUILD_NUMBER/" {} +
             ./gradlew assembleRelease bundleRelease --no-daemon
           else
-            ./gradlew assembleDebug --no-daemon
+            ./gradlew assembleRelease --no-daemon
           fi
       - name: Sign with your keystore
         if: env.PROFILE != 'debug' && env.CORTEX_ANDROID_KEYSTORE_BASE64 != ''
@@ -159,6 +159,7 @@ jobs:
         shell: bash
         env:
           IOS_DIR: ios
+          SIM_CONFIG: Release
         run: |
           cd "$IOS_DIR"
           WS=$(ls -d *.xcworkspace 2>/dev/null | grep -v "^Pods" | head -1 || true)
@@ -169,9 +170,9 @@ jobs:
           echo "Building $NAME, scheme $SCHEME"
           OUT="$GITHUB_WORKSPACE/cortex-out"; mkdir -p "$OUT"
           if [ "$PROFILE" = debug ]; then
-            xcodebuild "${SRC[@]}" -scheme "$SCHEME" -configuration Debug -sdk iphonesimulator \
+            xcodebuild "${SRC[@]}" -scheme "$SCHEME" -configuration "$SIM_CONFIG" -sdk iphonesimulator \
               -destination 'generic/platform=iOS Simulator' -derivedDataPath build/dd CODE_SIGNING_ALLOWED=NO build | tail -n 200
-            cp -R build/dd/Build/Products/Debug-iphonesimulator/*.app "$OUT/"
+            cp -R build/dd/Build/Products/"$SIM_CONFIG"-iphonesimulator/*.app "$OUT/"
             exit 0
           fi
           for v in CORTEX_APPLE_TEAM_ID CORTEX_ASC_KEY_ID CORTEX_ASC_ISSUER_ID CORTEX_ASC_KEY_P8; do
