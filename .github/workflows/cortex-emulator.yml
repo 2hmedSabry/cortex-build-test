@@ -1,4 +1,4 @@
-# cortex-emulator v1 api=34
+# cortex-emulator v2 api=34
 # Made by Cortex. Opens an Android emulator with one of your test builds and streams it to Cortex.
 name: Cortex Emulator
 run-name: Cortex Android emulator for build ${{ inputs.run_id }}
@@ -18,7 +18,7 @@ on:
 
 jobs:
   emulator:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CORTEX_LINUX_RUNNER || '"ubuntu-latest"') }}
     timeout-minutes: 80
     permissions:
       actions: read
@@ -40,12 +40,15 @@ jobs:
           sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
           (command -v cloudflared >/dev/null || (curl -fsSL -o /tmp/cf.deb https://github.com/cloudflare/cloudflared/releases/download/2026.8.3/cloudflared-linux-amd64.deb && sudo dpkg -i /tmp/cf.deb > /dev/null); touch "$RUNNER_TEMP/tools-ready") &
           SDK="$ANDROID_HOME/cmdline-tools/latest/bin"
-          yes | "$SDK/sdkmanager" --install "emulator" "platform-tools" "system-images;android-34;google_apis;x86_64" > /dev/null
-          echo no | "$SDK/avdmanager" create avd -n cortex -k "system-images;android-34;google_apis;x86_64" -d pixel_7 --force > /dev/null
+          yes | "$SDK/sdkmanager" --install "emulator" "platform-tools" "system-images;android-34;google_apis;x86_64" | tail -n 5
+          echo no | "$SDK/avdmanager" create avd -n cortex -k "system-images;android-34;google_apis;x86_64" -d pixel_7 --force
+          "$ANDROID_HOME/emulator/emulator" -list-avds
           echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
           nohup "$ANDROID_HOME/emulator/emulator" -avd cortex -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect > "$RUNNER_TEMP/emulator.log" 2>&1 &
-          "$ANDROID_HOME/platform-tools/adb" wait-for-device
+          # Give up (with the emulator's log) rather than hang until the session times out.
+          timeout 300 "$ANDROID_HOME/platform-tools/adb" wait-for-device || { tail -n 80 "$RUNNER_TEMP/emulator.log"; echo "::error::The emulator did not start"; exit 1; }
           for i in $(seq 1 120); do [ "$("$ANDROID_HOME/platform-tools/adb" shell getprop sys.boot_completed | tr -d "\r")" = 1 ] && break; sleep 3; done
+          [ "$("$ANDROID_HOME/platform-tools/adb" shell getprop sys.boot_completed | tr -d "\r")" = 1 ] || { tail -n 80 "$RUNNER_TEMP/emulator.log"; echo "::error::The emulator did not finish booting"; exit 1; }
       - name: Install your app
         run: |
           APK=$(find app -name '*.apk' | grep -v -- '-unsigned' | head -1)
