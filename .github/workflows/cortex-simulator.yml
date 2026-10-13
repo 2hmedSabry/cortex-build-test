@@ -1,4 +1,4 @@
-# cortex-simulator v7 serve-sim=0.1.47 bridge=147b83d6
+# cortex-simulator v8 serve-sim=0.1.47 bridge=147b83d6
 # Made by Cortex. Opens an iPhone simulator with one of your test builds and streams it to Cortex.
 name: Cortex Simulator
 run-name: Cortex iPhone simulator for build ${{ inputs.run_id }}
@@ -707,4 +707,4 @@ jobs:
         run: |
           gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=success -f context="cortex/simulator/$GITHUB_RUN_ID" \
             -f description="iPhone simulator closed" >/dev/null || true
-          cat "$RUNNER_TEMP/sim.log" 2>/dev/null | tail -n 40 || true
+          for f in sim proxy cf simbridge; do [ -f "$RUNNER_TEMP/$f.log" ] && { echo "--- $f.log"; tail -n 40 "$RUNNER_TEMP/$f.log"; }; done; true
