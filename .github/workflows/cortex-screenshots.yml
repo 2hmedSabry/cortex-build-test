@@ -1,0 +1,74 @@
+# cortex-screenshots v1
+# Made by Cortex. Takes App Store screenshots of one of your iPhone test builds.
+name: Cortex Screenshots
+run-name: Cortex App Store screenshots of build ${{ inputs.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: The Cortex Build run whose iPhone test build to use
+        required: true
+      links:
+        description: Deep links to open, one screenshot each (comma-separated)
+        required: false
+        default: ""
+
+jobs:
+  screenshots:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ios-debug
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: app
+      - name: Take the screenshots
+        env:
+          LINKS: ${{ inputs.links }}
+        run: |
+          APP=$(ls -d app/*.app | head -1)
+          BID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+          mkdir -p shots
+          xcrun simctl list devices available -j | python3 -c "$(cat <<'PY'
+          import json, sys
+          d = json.load(sys.stdin)["devices"]
+          ios = [x for k in sorted(d, reverse=True) if "iOS" in k for x in d[k] if x.get("isAvailable", True)]
+          def first(*names):
+              for n in names:
+                  for x in ios:
+                      if n in x["name"]:
+                          return x
+          picks = [first("Pro Max", "Plus"), first("iPad Pro 13", "iPad Air 13", "iPad Pro (12.9")]
+          print("\n".join(f'{x["udid"]}|{x["name"]}' for x in picks if x))
+          PY
+          )" > devices.txt
+          cat devices.txt
+          while IFS='|' read -r UDID NAME; do
+            [ -n "$UDID" ] || continue
+            DIR="shots/$(echo "$NAME" | tr -c "A-Za-z0-9-" "_")"; mkdir -p "$DIR"
+            xcrun simctl boot "$UDID"; xcrun simctl bootstatus "$UDID" -b > /dev/null
+            xcrun simctl status_bar "$UDID" override --time 9:41 --dataNetwork wifi --wifiBars 3 --cellularMode active --cellularBars 4 --batteryState charged --batteryLevel 100 || true
+            xcrun simctl install "$UDID" "$APP"
+            xcrun simctl launch "$UDID" "$BID"; sleep 12
+            xcrun simctl io "$UDID" screenshot "$DIR/1-launch.png"
+            N=2
+            IFS=',' read -ra L <<< "$LINKS"
+            for link in "${L[@]}"; do
+              link=$(echo "$link" | xargs); [ -n "$link" ] || continue
+              xcrun simctl openurl "$UDID" "$link"; sleep 6
+              xcrun simctl io "$UDID" screenshot "$DIR/$N-link.png"; N=$((N+1))
+            done
+            xcrun simctl shutdown "$UDID"
+          done < devices.txt
+          ls -R shots
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-store-screenshots
+          if-no-files-found: error
+          path: shots
