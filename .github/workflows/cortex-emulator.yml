@@ -1,0 +1,334 @@
+# cortex-emulator v1 api=34
+# Made by Cortex. Opens an Android emulator with one of your test builds and streams it to Cortex.
+name: Cortex Emulator
+run-name: Cortex Android emulator for build ${{ inputs.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: The Cortex Build run whose Android test build to open
+        required: true
+      key_hash:
+        description: SHA-256 of the session key Cortex holds
+        required: true
+      minutes:
+        description: How long to keep the emulator open
+        default: "20"
+
+jobs:
+  emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+    env:
+      UDID: android
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: android-debug
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: app
+      - name: Start the Android emulator
+        run: |
+          # Let the runner user use KVM, so the x86_64 emulator runs at full speed.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules > /dev/null
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          (command -v cloudflared >/dev/null || (curl -fsSL -o /tmp/cf.deb https://github.com/cloudflare/cloudflared/releases/download/2026.8.3/cloudflared-linux-amd64.deb && sudo dpkg -i /tmp/cf.deb > /dev/null); touch "$RUNNER_TEMP/tools-ready") &
+          SDK="$ANDROID_HOME/cmdline-tools/latest/bin"
+          yes | "$SDK/sdkmanager" --install "emulator" "platform-tools" "system-images;android-34;google_apis;x86_64" > /dev/null
+          echo no | "$SDK/avdmanager" create avd -n cortex -k "system-images;android-34;google_apis;x86_64" -d pixel_7 --force > /dev/null
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          nohup "$ANDROID_HOME/emulator/emulator" -avd cortex -no-window -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect > "$RUNNER_TEMP/emulator.log" 2>&1 &
+          "$ANDROID_HOME/platform-tools/adb" wait-for-device
+          for i in $(seq 1 120); do [ "$("$ANDROID_HOME/platform-tools/adb" shell getprop sys.boot_completed | tr -d "\r")" = 1 ] && break; sleep 3; done
+      - name: Install your app
+        run: |
+          APK=$(find app -name '*.apk' | grep -v -- '-unsigned' | head -1)
+          [ -n "$APK" ] || { echo "::error::The build has no installable .apk"; exit 1; }
+          adb install -r "$APK"
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          PKG=$("$BT/aapt2" dump packagename "$APK")
+          adb shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 > /dev/null
+      - name: Share the screen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CORTEX_KEY_HASH: ${{ inputs.key_hash }}
+        run: |
+          case "$CORTEX_KEY_HASH" in *[!0-9a-f]*|"") echo "::error::bad key_hash"; exit 1;; esac
+          for i in $(seq 1 120); do [ -f "$RUNNER_TEMP/tools-ready" ] && break; sleep 2; done
+          cat > "$RUNNER_TEMP/emu.js" <<'JS'
+          const http = require("http");
+          const crypto = require("crypto");
+          const { execFile, spawn } = require("child_process");
+          const ADB = process.env.ADB || "adb";
+          const PORT = Number(process.env.SIM_PORT || 3200);
+          const DEVICE = process.env.DEVICE || "android";
+          const adb = (args) => new Promise((resolve, reject) => {
+            execFile(ADB, args, { encoding: "buffer", maxBuffer: 64 * 1024 * 1024 }, (err, out) => (err ? reject(err) : resolve(out)));
+          });
+          let size = { width: 1080, height: 2400 };
+          async function readSize() {
+            try {
+              const m = /(\d+)x(\d+)/.exec(String(await adb(["shell", "wm", "size"])));
+              if (m) size = { width: Number(m[1]), height: Number(m[2]) };
+            } catch {}
+          }
+          readSize();
+
+          // Screenshots: one capture loop while anyone watches, the latest frame shared.
+          let latest = null;
+          const watchers = new Set();
+          let capturing = false;
+          async function captureLoop() {
+            if (capturing) return;
+            capturing = true;
+            while (watchers.size) {
+              try {
+                latest = await adb(["exec-out", "screencap", "-p"]);
+                for (const res of watchers) writeFrame(res, latest);
+              } catch {}
+              await new Promise((r) => setTimeout(r, 250));
+            }
+            capturing = false;
+          }
+          function writeFrame(res, png) {
+            res.write("--frame\r\nContent-Type: image/png\r\nContent-Length: " + png.length + "\r\n\r\n");
+            res.write(png);
+            res.write("\r\n");
+          }
+
+          // Input, run one at a time in order.
+          let queue = Promise.resolve();
+          const run = (args) => { queue = queue.then(() => adb(args)).catch(() => {}); return queue; };
+          const px = (f, n) => String(Math.round(Math.max(0, Math.min(1, Number(f))) * (n - 1)));
+          let touch = null;
+          let shift = false;
+          const Letters = "abcdefghijklmnopqrstuvwxyz";
+          const Digits = "1234567890";
+          const ShiftDigits = "!@#$%^&*()";
+          const Punct = { 0x2d: "-_", 0x2e: "=+", 0x2f: "[{", 0x30: "]}", 0x31: "\\|", 0x33: ";:", 0x34: "'\"", 0x35: "`~", 0x36: ",<", 0x37: ".>", 0x38: "/?" };
+          function charFor(usage) {
+            if (usage >= 0x04 && usage <= 0x1d) { const c = Letters[usage - 0x04]; return shift ? c.toUpperCase() : c; }
+            if (usage >= 0x1e && usage <= 0x27) return (shift ? ShiftDigits : Digits)[usage - 0x1e];
+            if (Punct[usage]) return Punct[usage][shift ? 1 : 0];
+            return null;
+          }
+          const KeyEvents = { 0x28: "66", 0x29: "111", 0x2a: "67", 0x2b: "61", 0x4c: "112", 0x4f: "22", 0x50: "21", 0x51: "20", 0x52: "19" };
+          function handle(msg) {
+            const tag = msg[0];
+            let body = {};
+            try { body = JSON.parse(msg.subarray(1).toString("utf8")); } catch {}
+            if (tag === 0x03) {
+              const x = px(body.x, size.width), y = px(body.y, size.height);
+              if (body.type === "begin") touch = { x, y, x0: x, y0: y, t: Date.now() };
+              else if (body.type === "move" && touch) { touch.x = x; touch.y = y; }
+              else if (body.type === "end" && touch) {
+                const ms = Math.max(50, Date.now() - touch.t);
+                const moved = Math.abs(x - touch.x0) + Math.abs(y - touch.y0) > 20;
+                if (!moved && ms < 500) run(["shell", "input", "tap", touch.x0, touch.y0]);
+                else run(["shell", "input", "swipe", touch.x0, touch.y0, x, y, String(Math.min(ms, 3000))]);
+                touch = null;
+              }
+            } else if (tag === 0x04) {
+              const code = { home: "3", back: "4", lock: "26" }[String(body.button || "home")];
+              if (code) run(["shell", "input", "keyevent", code]);
+            } else if (tag === 0x06) {
+              if (body.usage === 0xe1 || body.usage === 0xe5) { shift = body.type === "down"; return; }
+              if (body.type !== "down") return;
+              if (body.usage === 0x2c) return run(["shell", "input", "keyevent", "62"]);
+              if (KeyEvents[body.usage]) return run(["shell", "input", "keyevent", KeyEvents[body.usage]]);
+              const c = charFor(body.usage);
+              if (c) run(["shell", "input", "text", c.replace(/([\\'"`$&|;<>()*?!#~ ])/g, "\\$1")]);
+            }
+          }
+
+          // WebSocket frames.
+          function sendFrame(sock, data) {
+            const len = data.length;
+            const head = len < 126 ? Buffer.from([0x82, len]) : len < 65536 ? Buffer.from([0x82, 126, len >> 8, len & 255]) : null;
+            if (!head) return;
+            sock.write(Buffer.concat([head, data]));
+          }
+          function readFrames(sock, onMessage) {
+            let buf = Buffer.alloc(0);
+            sock.on("data", (d) => {
+              buf = Buffer.concat([buf, d]);
+              for (;;) {
+                if (buf.length < 2) return;
+                const op = buf[0] & 15;
+                let len = buf[1] & 127, at = 2;
+                if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); at = 4; }
+                else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); at = 10; }
+                const masked = (buf[1] & 128) !== 0;
+                const need = at + (masked ? 4 : 0) + len;
+                if (buf.length < need) return;
+                const mask = masked ? buf.subarray(at, at + 4) : null;
+                const payload = Buffer.from(buf.subarray(at + (masked ? 4 : 0), need));
+                if (mask) for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+                buf = buf.subarray(need);
+                if (op === 8) { sock.end(); return; }
+                if (op === 9) { sock.write(Buffer.concat([Buffer.from([0x8a, payload.length]), payload])); continue; }
+                if (op === 1 || op === 2) onMessage(payload);
+              }
+            });
+          }
+
+          const base = "/helper/" + DEVICE;
+          const server = http.createServer((req, res) => {
+            const path = String(req.url || "").split("?")[0];
+            if (path === base + "/stream.mjpeg") {
+              res.writeHead(200, { "Content-Type": "multipart/x-mixed-replace; boundary=frame", "Cache-Control": "no-cache, no-store" });
+              watchers.add(res);
+              if (latest) writeFrame(res, latest);
+              captureLoop();
+              req.on("close", () => watchers.delete(res));
+              return;
+            }
+            if (path === base + "/config") {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ...size, orientation: "portrait" }));
+              return;
+            }
+            res.writeHead(404).end();
+          });
+          server.on("upgrade", (req, sock) => {
+            if (String(req.url || "").split("?")[0] !== base + "/ws") { sock.destroy(); return; }
+            const accept = crypto.createHash("sha1").update(req.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+            sock.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n");
+            sendFrame(sock, Buffer.concat([Buffer.from([0x82]), Buffer.from(JSON.stringify({ ...size, orientation: "portrait" }))]));
+            readFrames(sock, handle);
+            sock.on("error", () => {});
+          });
+          server.listen(PORT, "127.0.0.1");
+          JS
+          nohup env DEVICE=android node "$RUNNER_TEMP/emu.js" > "$RUNNER_TEMP/emu.log" 2>&1 &
+          cat > "$RUNNER_TEMP/proxy.js" <<'JS'
+          const http = require("http");
+          const net = require("net");
+          const crypto = require("crypto");
+          const HASH = process.env.CORTEX_KEY_HASH;
+          const UDID = process.env.UDID;
+          const TARGET = Number(process.env.SIM_PORT || 3200);
+          const sha = (s) => crypto.createHash("sha256").update(s).digest("hex");
+          // A page anyone with the session link can open in a browser: the screen, touch,
+          // the Home button and typing (the same calls Cortex's own panel makes).
+          const VIEW_HTML = [
+            "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>",
+            "<title>iPhone simulator</title><style>",
+            "html,body{margin:0;height:100%;background:#0b0f14;color:#9aa4b2;font:13px -apple-system,Segoe UI,sans-serif}",
+            "#w{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}",
+            "#s{max-height:88vh;max-width:96vw;border-radius:22px;touch-action:none;cursor:pointer;background:#000}",
+            "button{background:#1b2230;color:#e6e6e6;border:1px solid #2c3647;border-radius:6px;padding:6px 12px;cursor:pointer}",
+            "</style></head><body><div id=w><img id=s draggable=false alt=''><div><button id=h>Home</button> ",
+            "<span>Shared from Cortex. Click the screen to type.</span></div></div><script>",
+            "var k=new URLSearchParams(location.search).get('k')||'';",
+            "function usage(c){if(c=='Enter')return[40,0];if(c=='Backspace')return[42,0];if(c==' ')return[44,0];",
+            "if(c.length!=1)return null;var l=c.toLowerCase();if(l>='a'&&l<='z')return[4+l.charCodeAt(0)-97,c!=l?1:0];",
+            "if(c>='1'&&c<='9')return[30+c.charCodeAt(0)-49,0];if(c=='0')return[39,0];",
+            "var p={'-':[45,0],'.':[55,0],',':[54,0],'/':[56,0],'@':[31,1],'?':[56,1],'!':[30,1]};return p[c]||null}",
+            "fetch('/cortex/info?k='+encodeURIComponent(k)).then(function(r){return r.json()}).then(function(i){",
+            "var u='/helper/'+i.udid,img=document.getElementById('s');",
+            "img.src=u+'/stream.mjpeg?k='+encodeURIComponent(k);",
+            "var ws=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host+u+'/ws?k='+encodeURIComponent(k));",
+            "ws.binaryType='arraybuffer';",
+            "function send(t,o){var b=new TextEncoder().encode(JSON.stringify(o)),m=new Uint8Array(b.length+1);m[0]=t;m.set(b,1);if(ws.readyState==1)ws.send(m)}",
+            "function pt(e){var r=img.getBoundingClientRect(),w=img.naturalWidth,h=img.naturalHeight;if(!w)return null;",
+            "var s=Math.min(r.width/w,r.height/h),dw=w*s,dh=h*s,x=(e.clientX-r.left-(r.width-dw)/2)/dw,y=(e.clientY-r.top-(r.height-dh)/2)/dh;",
+            "return x<0||x>1||y<0||y>1?null:{x:x,y:y}}",
+            "var down=false;",
+            "img.onpointerdown=function(e){var p=pt(e);if(!p)return;down=true;img.setPointerCapture(e.pointerId);send(3,{type:'begin',x:p.x,y:p.y})};",
+            "img.onpointermove=function(e){if(!down)return;var p=pt(e);if(p)send(3,{type:'move',x:p.x,y:p.y})};",
+            "img.onpointerup=function(e){if(!down)return;down=false;var p=pt(e)||{x:.5,y:.5};send(3,{type:'end',x:p.x,y:p.y})};",
+            "document.getElementById('h').onclick=function(){send(4,{button:'home'})};",
+            "document.onkeydown=function(e){var c=usage(e.key);if(!c||e.metaKey||e.ctrlKey)return;e.preventDefault();",
+            "if(c[1])send(6,{type:'down',usage:225});send(6,{type:'down',usage:c[0]});send(6,{type:'up',usage:c[0]});if(c[1])send(6,{type:'up',usage:225})};",
+            "});</script></body></html>",
+          ].join("");
+
+          function check(rawUrl) {
+            const u = new URL(rawUrl, "http://proxy");
+            const key = u.searchParams.get("k") || "";
+            const okKey = key.length > 0 && crypto.timingSafeEqual(Buffer.from(sha(key)), Buffer.from(HASH));
+            const okPath = u.pathname === "/cortex/info" || u.pathname === "/cortex/view" || u.pathname.startsWith("/helper/" + UDID + "/");
+            u.searchParams.delete("k");
+            return { ok: okKey && okPath, u };
+          }
+          function forwardHeaders(raw) {
+            const out = {};
+            for (let i = 0; i < raw.length; i += 2) {
+              const name = raw[i].toLowerCase();
+              if (name !== "origin" && name !== "host" && name !== "referer") out[raw[i]] = raw[i + 1];
+            }
+            out.Host = "127.0.0.1:" + TARGET;
+            return out;
+          }
+          const cors = { "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" };
+          const server = http.createServer((req, res) => {
+            const { ok, u } = check(req.url);
+            if (!ok) { res.writeHead(403, cors); res.end("forbidden"); return; }
+            if (u.pathname === "/cortex/view") {
+              res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+              res.end(VIEW_HTML);
+              return;
+            }
+            if (u.pathname === "/cortex/info") {
+              res.writeHead(200, { ...cors, "Content-Type": "application/json" });
+              res.end(JSON.stringify({ udid: UDID }));
+              return;
+            }
+            const up = http.request(
+              { host: "127.0.0.1", port: TARGET, method: req.method, path: u.pathname + u.search, headers: forwardHeaders(req.rawHeaders) },
+              (r) => {
+                // serve-sim sends its own CORS headers; replace them so there is one of each.
+                const h = {};
+                for (const name of Object.keys(r.headers)) if (!name.startsWith("access-control-")) h[name] = r.headers[name];
+                res.writeHead(r.statusCode, { ...h, ...cors });
+                r.pipe(res);
+              }
+            );
+            up.on("error", () => { if (!res.headersSent) res.writeHead(502, cors); res.end(); });
+            req.pipe(up);
+          });
+          server.on("upgrade", (req, sock, head) => {
+            const { ok, u } = check(req.url);
+            if (!ok) { sock.end("HTTP/1.1 403 Forbidden\r\n\r\n"); return; }
+            const up = net.connect(TARGET, "127.0.0.1", () => {
+              const h = forwardHeaders(req.rawHeaders);
+              const lines = [req.method + " " + u.pathname + u.search + " HTTP/1.1"];
+              for (const name of Object.keys(h)) lines.push(name + ": " + h[name]);
+              up.write(lines.join("\r\n") + "\r\n\r\n");
+              up.write(head);
+              sock.pipe(up).pipe(sock);
+            });
+            up.on("error", () => sock.destroy());
+            sock.on("error", () => up.destroy());
+          });
+          server.listen(Number(process.env.PROXY_PORT || 3300), "127.0.0.1");
+          JS
+          nohup node "$RUNNER_TEMP/proxy.js" > "$RUNNER_TEMP/proxy.log" 2>&1 &
+          nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:3300 > "$RUNNER_TEMP/cf.log" 2>&1 &
+          for i in $(seq 1 45); do URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$RUNNER_TEMP/cf.log" | head -1); [ -n "$URL" ] && break; sleep 2; done
+          [ -n "$URL" ] || { cat "$RUNNER_TEMP/cf.log"; echo "::error::The tunnel did not start"; exit 1; }
+          # Cortex reads the link from this status; it is useless without the key Cortex holds.
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=pending -f context="cortex/simulator/$GITHUB_RUN_ID" \
+            -f target_url="$URL" -f description="Android emulator is open" >/dev/null
+      - name: Keep it open
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          case "$MINUTES" in ""|*[!0-9]*) MINUTES=20;; esac
+          [ "$MINUTES" -gt 60 ] && MINUTES=60
+          sleep $(( MINUTES * 60 ))
+      - name: Close
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=success -f context="cortex/simulator/$GITHUB_RUN_ID" \
+            -f description="Android emulator closed" >/dev/null || true
+          tail -n 40 "$RUNNER_TEMP/emu.log" 2>/dev/null || true
