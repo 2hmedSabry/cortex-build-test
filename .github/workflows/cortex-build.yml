@@ -1,4 +1,4 @@
-# cortex-build v7 stack=expo dir=.
+# cortex-build v8 stack=expo dir=.
 # Made by Cortex. Builds run on your GitHub account; Cortex starts them and downloads the results.
 name: Cortex Build
 run-name: Cortex ${{ inputs.platform }} ${{ inputs.profile }} build${{ inputs.ref && format(' of {0}', inputs.ref) || '' }}
@@ -26,7 +26,7 @@ env:
 jobs:
   android:
     if: inputs.platform != 'ios'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CORTEX_LINUX_RUNNER || '"ubuntu-latest"') }}
     timeout-minutes: 90
     env:
       CORTEX_ANDROID_KEYSTORE_BASE64: ${{ secrets.CORTEX_ANDROID_KEYSTORE_BASE64 }}
@@ -168,7 +168,7 @@ jobs:
 
   ios:
     if: inputs.platform != 'android'
-    runs-on: macos-latest
+    runs-on: ${{ fromJSON(vars.CORTEX_MAC_RUNNER || '"macos-latest"') }}
     timeout-minutes: 90
     env:
       CORTEX_APPLE_TEAM_ID: ${{ secrets.CORTEX_APPLE_TEAM_ID }}
