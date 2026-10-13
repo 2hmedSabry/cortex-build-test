@@ -1,4 +1,4 @@
-# cortex-simulator v6 serve-sim=0.1.47 bridge=147b83d6
+# cortex-simulator v7 serve-sim=0.1.47 bridge=147b83d6
 # Made by Cortex. Opens an iPhone simulator with one of your test builds and streams it to Cortex.
 name: Cortex Simulator
 run-name: Cortex iPhone simulator for build ${{ inputs.run_id }}
@@ -550,8 +550,9 @@ jobs:
           #!/bin/bash
           case "$1" in
             tree)
-              [ -x "$RUNNER_TEMP/simbridge" ] || { echo "the element reader didn't build:"; tail -n 20 "$RUNNER_TEMP/simbridge.log"; } >&2
-              exec "$RUNNER_TEMP/simbridge" --udid "$UDID" --describe ;;
+              [ -x "$RUNNER_TEMP/simbridge" ] || { { echo "the element reader didn't build:"; tail -n 20 "$RUNNER_TEMP/simbridge.log"; } >&2; exit 1; }
+              # Its errors come as {"error": ...} on stdout, which Cortex reads.
+              "$RUNNER_TEMP/simbridge" --udid "$UDID" --describe; exit 0 ;;
             launch) xcrun simctl launch "$UDID" "$2" > /dev/null && echo "launched $2" ;;
             terminate) xcrun simctl terminate "$UDID" "$2" > /dev/null 2>&1; echo "stopped $2" ;;
             openurl) xcrun simctl openurl "$UDID" "$2" && echo "opened $2" ;;
@@ -645,7 +646,7 @@ jobs:
                 args = [op, arg];
               }
               execFile(CTL, args, { timeout: 60000, maxBuffer: 32 << 20 }, (err, out, errOut) => {
-                if (err) { res.writeHead(500, { ...cors, "Content-Type": "text/plain" }); res.end(String(errOut || err.message).slice(-2000)); return; }
+                if (err) { res.writeHead(500, { ...cors, "Content-Type": "text/plain" }); res.end(String(errOut || out || err.message).slice(-2000)); return; }
                 res.writeHead(200, { ...cors, "Content-Type": "text/plain; charset=utf-8" });
                 res.end(out);
               });
