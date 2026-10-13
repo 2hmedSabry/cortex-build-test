@@ -1,4 +1,4 @@
-# cortex-simulator v4 serve-sim=0.1.47
+# cortex-simulator v6 serve-sim=0.1.47 bridge=147b83d6
 # Made by Cortex. Opens an iPhone simulator with one of your test builds and streams it to Cortex.
 name: Cortex Simulator
 run-name: Cortex iPhone simulator for build ${{ inputs.run_id }}
@@ -18,7 +18,7 @@ on:
 
 jobs:
   simulator:
-    runs-on: macos-latest
+    runs-on: ${{ fromJSON(vars.CORTEX_MAC_RUNNER || '"macos-latest"') }}
     timeout-minutes: 75
     permissions:
       actions: read
@@ -35,15 +35,507 @@ jobs:
         run: |
           # The streaming tools download while the iPhone boots (the boot takes minutes).
           (brew install cloudflared >/dev/null 2>&1; npm cache add serve-sim@0.1.47 >/dev/null 2>&1; touch "$RUNNER_TEMP/tools-ready") &
+          cat > "$RUNNER_TEMP/simbridge.m" <<'OBJC'
+          // Copyright 2026, Command Line Inc.
+          // SPDX-License-Identifier: Apache-2.0
+
+          // cortex-simbridge: streams an iOS Simulator screen as H.264 and injects touches,
+          // hardware buttons and keys, without Simulator.app being open.
+          //
+          // It talks to CoreSimulator and SimulatorKit (private Xcode frameworks) through
+          // the Objective-C runtime, the same way idb does.
+          //
+          //   stdout: frames of [type u8][length u32 BE][payload]
+          //           type 1: JSON info {"width","height"} (pixels), sent on start and on resize
+          //           type 2: H.264 Annex B access unit: [flags u8 (1 = key)][pts u64 BE µs][data]
+          //           type 3: JSON log/error line
+          //   stdin:  one JSON command per line
+          //           {"t":"touch","phase":"down|move|up","x":0..1,"y":0..1}
+          //           {"t":"button","name":"home|lock|siri|side"}
+          //           {"t":"key","usage":<HID usage>,"down":true|false}
+          //           {"t":"keyframe"}
+          //
+          // cortex-simbridge --udid <udid> --describe prints the accessibility tree of
+          // the app in front (role, label, value, id, frame in points) as JSON and exits.
+
+          #import <CoreMedia/CoreMedia.h>
+          #import <CoreVideo/CoreVideo.h>
+          #import <Foundation/Foundation.h>
+          #import <IOSurface/IOSurface.h>
+          #import <VideoToolbox/VideoToolbox.h>
+          #import <dlfcn.h>
+          #import <mach/mach_time.h>
+
+          // ---- private API surface (resolved at runtime) ----
+
+          @interface NSObject (SimBridgePrivate)
+          + (id)sharedServiceContextForDeveloperDir:(NSString *)dir error:(NSError **)error;
+          - (id)defaultDeviceSetWithError:(NSError **)error;
+          - (NSArray *)devices;
+          - (NSUUID *)UDID;
+          - (id)io;
+          - (NSArray *)ioPorts;
+          - (id)descriptor;
+          - (unsigned short)displayClass;
+          - (IOSurfaceRef)framebufferSurface;
+          - (void)registerCallbackWithUUID:(NSUUID *)uuid ioSurfacesChangeCallback:(void (^)(id))cb;
+          - (void)registerCallbackWithUUID:(NSUUID *)uuid damageRectanglesCallback:(void (^)(NSArray *))cb;
+          - (instancetype)initWithDevice:(id)device error:(NSError **)error;
+          - (void)sendWithMessage:(void *)msg freeWhenDone:(BOOL)free completionQueue:(dispatch_queue_t)q completion:(void (^)(NSError *))cb;
+          // AccessibilityPlatformTranslation
+          + (instancetype)sharedInstance;
+          - (void)setBridgeTokenDelegate:(id)d;
+          - (void)setSupportsDelegateTokens:(BOOL)b;
+          - (id)frontmostApplicationWithDisplayId:(unsigned)d bridgeDelegateToken:(NSString *)t;
+          - (id)macPlatformElementFromTranslation:(id)t;
+          - (void)setBridgeDelegateToken:(NSString *)t;
+          - (id)translation;
+          - (void)sendAccessibilityRequestAsync:(id)req completionQueue:(dispatch_queue_t)q completionHandler:(void (^)(id))h;
+          - (NSArray *)accessibilityChildren;
+          - (NSString *)accessibilityRole;
+          - (NSString *)accessibilityLabel;
+          - (id)accessibilityValue;
+          - (NSString *)accessibilityIdentifier;
+          - (CGRect)accessibilityFrame;
+          @end
+
+          typedef void *(*MouseEventFn)(CGPoint *p0, CGPoint *p1, uint32_t target, uint64_t eventType, uint64_t edge, CGSize size);
+          typedef void *(*ButtonFn)(uint32_t source, uint32_t direction, uint32_t target);
+          typedef void *(*KeyboardFn)(uint32_t usage, uint32_t op);
+
+          static MouseEventFn gMouseEvent;
+          static ButtonFn gButton;
+          static KeyboardFn gKeyboard;
+          static id gHID;
+          static dispatch_queue_t gHIDQueue;
+
+          // ---- output framing ----
+
+          static dispatch_queue_t gOutQueue;
+
+          static void emit(uint8_t type, NSData *payload) {
+              dispatch_async(gOutQueue, ^{
+                  uint8_t hdr[5];
+                  uint32_t len = (uint32_t)payload.length;
+                  hdr[0] = type;
+                  hdr[1] = (len >> 24) & 0xff;
+                  hdr[2] = (len >> 16) & 0xff;
+                  hdr[3] = (len >> 8) & 0xff;
+                  hdr[4] = len & 0xff;
+                  fwrite(hdr, 1, 5, stdout);
+                  fwrite(payload.bytes, 1, payload.length, stdout);
+                  fflush(stdout);
+              });
+          }
+
+          static void emitJSON(uint8_t type, NSDictionary *obj) {
+              emit(type, [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil]);
+          }
+
+          static void logLine(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+          static void logLine(NSString *fmt, ...) {
+              va_list ap;
+              va_start(ap, fmt);
+              NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+              va_end(ap);
+              emitJSON(3, @{@"log" : s});
+          }
+
+          static BOOL gPlain;  // --describe: output is one JSON document, not frames
+
+          static void fail(NSString *msg) {
+              if (gPlain) {
+                  NSData *j = [NSJSONSerialization dataWithJSONObject:@{@"error" : msg} options:0 error:nil];
+                  fwrite(j.bytes, 1, j.length, stdout);
+                  fflush(stdout);
+                  exit(1);
+              }
+              emitJSON(3, @{@"error" : msg});
+              dispatch_sync(gOutQueue, ^{});
+              exit(1);
+          }
+
+          // ---- encoder ----
+
+          static dispatch_queue_t gEncQueue;
+          static VTCompressionSessionRef gSession;
+          static int32_t gWidth, gHeight;
+          static IOSurfaceRef gSurface;
+          static uint32_t gLastSeed;
+          static BOOL gForceKey = YES;
+          static BOOL gDirty = YES;
+          static uint64_t gStartNs;
+
+          static uint64_t nowNs(void) {
+              static mach_timebase_info_data_t tb;
+              if (tb.denom == 0) mach_timebase_info(&tb);
+              return mach_absolute_time() * tb.numer / tb.denom;
+          }
+
+          static void appendAnnexB(NSMutableData *out, const uint8_t *nal, size_t len) {
+              static const uint8_t sc[4] = {0, 0, 0, 1};
+              [out appendBytes:sc length:4];
+              [out appendBytes:nal length:len];
+          }
+
+          static void encoded(void *ref, void *frameRef, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sb) {
+              if (status != noErr || sb == NULL || !CMSampleBufferDataIsReady(sb)) return;
+              BOOL key = YES;
+              CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sb, false);
+              if (atts && CFArrayGetCount(atts) > 0) {
+                  CFDictionaryRef a = CFArrayGetValueAtIndex(atts, 0);
+                  key = !CFDictionaryContainsKey(a, kCMSampleAttachmentKey_NotSync);
+              }
+              NSMutableData *au = [NSMutableData data];
+              uint8_t flagsByte = key ? 1 : 0;
+              CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb);
+              uint64_t ptsUs = (uint64_t)(CMTimeGetSeconds(pts) * 1e6);
+              [au appendBytes:&flagsByte length:1];
+              for (int i = 7; i >= 0; i--) {
+                  uint8_t b = (ptsUs >> (i * 8)) & 0xff;
+                  [au appendBytes:&b length:1];
+              }
+              if (key) {
+                  CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb);
+                  size_t count = 0;
+                  CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, 0, NULL, NULL, &count, NULL);
+                  for (size_t i = 0; i < count; i++) {
+                      const uint8_t *ps;
+                      size_t psLen;
+                      if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, i, &ps, &psLen, NULL, NULL) == noErr) {
+                          appendAnnexB(au, ps, psLen);
+                      }
+                  }
+              }
+              CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+              size_t total = 0;
+              char *ptr = NULL;
+              if (CMBlockBufferGetDataPointer(bb, 0, NULL, &total, &ptr) != noErr) return;
+              size_t off = 0;
+              while (off + 4 <= total) {
+                  uint32_t nlen = ((uint8_t)ptr[off] << 24) | ((uint8_t)ptr[off + 1] << 16) | ((uint8_t)ptr[off + 2] << 8) | (uint8_t)ptr[off + 3];
+                  off += 4;
+                  if (off + nlen > total) break;
+                  appendAnnexB(au, (const uint8_t *)ptr + off, nlen);
+                  off += nlen;
+              }
+              emit(2, au);
+          }
+
+          static void makeSession(int32_t w, int32_t h) {
+              if (gSession) {
+                  VTCompressionSessionCompleteFrames(gSession, kCMTimeInvalid);
+                  VTCompressionSessionInvalidate(gSession);
+                  CFRelease(gSession);
+                  gSession = NULL;
+              }
+              NSDictionary *spec = @{(id)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder : @YES};
+              OSStatus st = VTCompressionSessionCreate(NULL, w, h, kCMVideoCodecType_H264, (__bridge CFDictionaryRef)spec, NULL, NULL, encoded, NULL, &gSession);
+              if (st != noErr) fail([NSString stringWithFormat:@"VTCompressionSessionCreate failed: %d", (int)st]);
+              VTSessionSetProperty(gSession, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+              VTSessionSetProperty(gSession, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+              VTSessionSetProperty(gSession, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
+              VTSessionSetProperty(gSession, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFTypeRef) @(600));
+              VTSessionSetProperty(gSession, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFTypeRef) @(8 * 1000 * 1000));
+              VTSessionSetProperty(gSession, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFTypeRef) @(60));
+              VTCompressionSessionPrepareToEncodeFrames(gSession);
+              gWidth = w;
+              gHeight = h;
+              gForceKey = YES;
+              emitJSON(1, @{@"width" : @(w), @"height" : @(h)});
+          }
+
+          static void encodeNow(void) {
+              if (!gSurface) return;
+              int32_t w = (int32_t)IOSurfaceGetWidth(gSurface), h = (int32_t)IOSurfaceGetHeight(gSurface);
+              if (w <= 0 || h <= 0) return;
+              if (!gSession || w != gWidth || h != gHeight) makeSession(w, h);
+              uint32_t seed = IOSurfaceGetSeed(gSurface);
+              if (!gDirty && !gForceKey && seed == gLastSeed) return;
+              gDirty = NO;
+              gLastSeed = seed;
+              CVPixelBufferRef pb = NULL;
+              if (CVPixelBufferCreateWithIOSurface(NULL, gSurface, NULL, &pb) != kCVReturnSuccess || !pb) return;
+              NSDictionary *props = gForceKey ? @{(id)kVTEncodeFrameOptionKey_ForceKeyFrame : @YES} : nil;
+              gForceKey = NO;
+              CMTime pts = CMTimeMake((int64_t)((nowNs() - gStartNs) / 1000), 1000000);
+              VTCompressionSessionEncodeFrame(gSession, pb, pts, kCMTimeInvalid, (__bridge CFDictionaryRef)props, NULL, NULL);
+              CVPixelBufferRelease(pb);
+          }
+
+          // ---- simulator lookup ----
+
+          static id findDevice(NSString *udid) {
+              NSString *dev = [[NSProcessInfo processInfo].environment objectForKey:@"DEVELOPER_DIR"];
+              if (!dev.length) {
+                  NSTask *t = [NSTask new];
+                  NSPipe *p = [NSPipe pipe];
+                  t.launchPath = @"/usr/bin/xcode-select";
+                  t.arguments = @[ @"-p" ];
+                  t.standardOutput = p;
+                  [t launch];
+                  [t waitUntilExit];
+                  dev = [[[NSString alloc] initWithData:[p.fileHandleForReading readDataToEndOfFile] encoding:NSUTF8StringEncoding]
+                      stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+              }
+              if (!dlopen("/Library/Developer/PrivateFrameworks/CoreSimulator.framework/CoreSimulator", RTLD_NOW)) fail(@"cannot load CoreSimulator");
+              NSString *sk = [dev stringByAppendingPathComponent:@"Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit"];
+              void *skh = dlopen(sk.UTF8String, RTLD_NOW);
+              if (!skh) fail([NSString stringWithFormat:@"cannot load SimulatorKit from %@", sk]);
+              gMouseEvent = (MouseEventFn)dlsym(skh, "IndigoHIDMessageForMouseNSEvent");
+              gButton = (ButtonFn)dlsym(skh, "IndigoHIDMessageForButton");
+              gKeyboard = (KeyboardFn)dlsym(skh, "IndigoHIDMessageForKeyboardArbitrary");
+              if (!gMouseEvent || !gButton || !gKeyboard) fail(@"SimulatorKit is missing the Indigo HID functions");
+
+              NSError *err = nil;
+              id ctx = [NSClassFromString(@"SimServiceContext") sharedServiceContextForDeveloperDir:dev error:&err];
+              if (!ctx) fail([NSString stringWithFormat:@"no CoreSimulator service: %@", err]);
+              id set = [ctx defaultDeviceSetWithError:&err];
+              if (!set) fail([NSString stringWithFormat:@"no device set: %@", err]);
+              for (id d in [set devices]) {
+                  if ([[[d UDID] UUIDString] caseInsensitiveCompare:udid] == NSOrderedSame) return d;
+              }
+              fail([NSString stringWithFormat:@"no simulator with UDID %@", udid]);
+              return nil;
+          }
+
+          // ---- accessibility tree ----
+
+          // Answers the translator's requests by forwarding them to the simulator.
+          @interface AXBridge : NSObject
+          @property(strong) id device;
+          @property(strong) dispatch_queue_t queue;
+          @end
+
+          @implementation AXBridge
+          - (id)accessibilityTranslationDelegateBridgeCallbackWithToken:(NSString *)token {
+              return ^id(id request) {
+                __block id resp = nil;
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                [self.device sendAccessibilityRequestAsync:request
+                                           completionQueue:self.queue
+                                         completionHandler:^(id r) {
+                                           resp = r;
+                                           dispatch_semaphore_signal(sem);
+                                         }];
+                dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+                return resp;
+              };
+          }
+          - (CGRect)accessibilityTranslationConvertPlatformFrameToSystem:(CGRect)rect withToken:(NSString *)token {
+              return rect;
+          }
+          - (id)accessibilityTranslationRootParentWithToken:(NSString *)token {
+              return nil;
+          }
+          @end
+
+          static int gAXCount;
+
+          static NSDictionary *axNode(id el, NSString *token, int depth) {
+              [[el translation] setBridgeDelegateToken:token];
+              gAXCount++;
+              CGRect f = [el accessibilityFrame];
+              NSMutableDictionary *d = [NSMutableDictionary dictionary];
+              d[@"role"] = [el accessibilityRole] ?: @"";
+              NSString *label = [el accessibilityLabel];
+              if (label.length) d[@"label"] = label;
+              id value = [el accessibilityValue];
+              if (value && [[value description] length]) d[@"value"] = [value description];
+              NSString *ident = [el accessibilityIdentifier];
+              if (ident.length) d[@"id"] = ident;
+              d[@"frame"] = @[ @(f.origin.x), @(f.origin.y), @(f.size.width), @(f.size.height) ];
+              if (depth < 60 && gAXCount < 4000) {
+                  NSMutableArray *kids = [NSMutableArray array];
+                  for (id c in [el accessibilityChildren]) [kids addObject:axNode(c, token, depth + 1)];
+                  if (kids.count) d[@"children"] = kids;
+              }
+              return d;
+          }
+
+          static void describeTree(id device) {
+              if (!dlopen("/System/Library/PrivateFrameworks/AccessibilityPlatformTranslation.framework/AccessibilityPlatformTranslation", RTLD_NOW)) {
+                  fail(@"cannot load AccessibilityPlatformTranslation");
+              }
+              AXBridge *bridge = [AXBridge new];
+              bridge.device = device;
+              bridge.queue = dispatch_queue_create("ax", DISPATCH_QUEUE_SERIAL);
+              id translator = [NSClassFromString(@"AXPTranslator") sharedInstance];
+              [translator setSupportsDelegateTokens:YES];
+              [translator setBridgeTokenDelegate:bridge];
+              NSString *token = [[NSUUID UUID] UUIDString];
+              id app = [translator frontmostApplicationWithDisplayId:0 bridgeDelegateToken:token];
+              if (!app) fail(@"no app is in front (is the simulator booted and unlocked?)");
+              [app setBridgeDelegateToken:token];
+              NSDictionary *tree = axNode([translator macPlatformElementFromTranslation:app], token, 0);
+              NSData *json = [NSJSONSerialization dataWithJSONObject:tree options:0 error:nil];
+              fwrite(json.bytes, 1, json.length, stdout);
+              fflush(stdout);
+          }
+
+          static id mainDisplay(id device) {
+              // The descriptors are remote proxies, so respondsToSelector: only sees the
+              // framebuffer protocol. displayClass 0 is the main (touch) screen; right
+              // after boot a screen can exist without a framebuffer yet, so prefer one
+              // that has it and let the caller wait otherwise.
+              id withSurface = nil;
+              for (id port in [[device io] ioPorts]) {
+                  if (![port respondsToSelector:@selector(descriptor)]) continue;
+                  id desc = [port descriptor];
+                  if (![desc respondsToSelector:@selector(framebufferSurface)]) continue;
+                  unsigned short dc = 0xffff;
+                  @try {
+                      dc = [desc displayClass];
+                  } @catch (NSException *e) {
+                  }
+                  BOOL has = [desc framebufferSurface] != NULL;
+                  if (getenv("SIMBRIDGE_DEBUG")) logLine(@"display class %d framebuffer %d", dc, has);
+                  if (dc == 0 && has) return desc;
+                  if (has && !withSurface) withSurface = desc;
+              }
+              return withSurface;
+          }
+
+          static id waitForDisplay(id device, double seconds) {
+              for (double waited = 0; waited < seconds; waited += 0.25) {
+                  id d = mainDisplay(device);
+                  if (d) return d;
+                  [NSThread sleepForTimeInterval:0.25];
+              }
+              return nil;
+          }
+
+          // ---- input ----
+
+          static void sendHID(void *msg) {
+              if (!msg) return;
+              [gHID sendWithMessage:msg freeWhenDone:YES completionQueue:gHIDQueue completion:^(NSError *e) {
+                if (e) logLine(@"hid send failed: %@", e.localizedDescription);
+              }];
+          }
+
+          static void touch(NSString *phase, double x, double y) {
+              CGPoint p = CGPointMake(x, y);
+              uint64_t type = [phase isEqualToString:@"down"] ? 1 : [phase isEqualToString:@"up"] ? 2 : 6;
+              sendHID(gMouseEvent(&p, NULL, 0x32, type, 0, CGSizeMake(1.0, 1.0)));
+          }
+
+          static void button(NSString *name) {
+              uint32_t src;
+              if ([name isEqualToString:@"home"]) src = 0x0;
+              else if ([name isEqualToString:@"lock"]) src = 0x1;
+              else if ([name isEqualToString:@"side"]) src = 0xbb8;
+              else if ([name isEqualToString:@"siri"]) src = 0x400002;
+              else return;
+              sendHID(gButton(src, 1, 0x33));
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC), gHIDQueue, ^{
+                sendHID(gButton(src, 2, 0x33));
+              });
+          }
+
+          static void handleCommand(NSDictionary *cmd) {
+              NSString *t = cmd[@"t"];
+              if ([t isEqualToString:@"touch"]) {
+                  touch(cmd[@"phase"], [cmd[@"x"] doubleValue], [cmd[@"y"] doubleValue]);
+              } else if ([t isEqualToString:@"button"]) {
+                  button(cmd[@"name"]);
+              } else if ([t isEqualToString:@"key"]) {
+                  sendHID(gKeyboard([cmd[@"usage"] unsignedIntValue], [cmd[@"down"] boolValue] ? 1 : 2));
+              } else if ([t isEqualToString:@"keyframe"]) {
+                  dispatch_async(gEncQueue, ^{
+                    gForceKey = YES;
+                    encodeNow();
+                  });
+              }
+          }
+
+          int main(int argc, const char **argv) {
+              @autoreleasepool {
+                  gOutQueue = dispatch_queue_create("out", DISPATCH_QUEUE_SERIAL);
+                  gEncQueue = dispatch_queue_create("enc", DISPATCH_QUEUE_SERIAL);
+                  gHIDQueue = dispatch_queue_create("hid", DISPATCH_QUEUE_SERIAL);
+                  gStartNs = nowNs();
+                  NSString *udid = nil;
+                  BOOL describe = NO;
+                  for (int i = 1; i < argc; i++) {
+                      if (!strcmp(argv[i], "--udid") && i + 1 < argc) udid = @(argv[i + 1]);
+                      if (!strcmp(argv[i], "--describe")) describe = YES;
+                  }
+                  gPlain = describe;
+                  if (!udid) fail(@"usage: cortex-simbridge --udid <simulator udid> [--describe]");
+
+                  id device = findDevice(udid);
+                  if (describe) {
+                      describeTree(device);
+                      return 0;
+                  }
+                  NSError *err = nil;
+                  gHID = [[NSClassFromString(@"_TtC12SimulatorKit24SimDeviceLegacyHIDClient") alloc] initWithDevice:device error:&err];
+                  if (!gHID) fail([NSString stringWithFormat:@"cannot open HID client: %@", err]);
+
+                  id display = waitForDisplay(device, 30);
+                  if (!display) fail(@"the simulator screen isn't ready; is it booted?");
+                  IOSurfaceRef first = [display framebufferSurface];
+                  if (!first) fail(@"the simulator screen has no framebuffer yet");
+                  gSurface = (IOSurfaceRef)CFRetain(first);
+
+                  NSUUID *cbID = [NSUUID UUID];
+                  if ([display respondsToSelector:@selector(registerCallbackWithUUID:ioSurfacesChangeCallback:)]) {
+                      [display registerCallbackWithUUID:cbID ioSurfacesChangeCallback:^(id _) {
+                        dispatch_async(gEncQueue, ^{
+                          IOSurfaceRef s = [display framebufferSurface];
+                          if (s && s != gSurface) {
+                              CFRelease(gSurface);
+                              gSurface = (IOSurfaceRef)CFRetain(s);
+                          }
+                          gDirty = YES;
+                          encodeNow();
+                        });
+                      }];
+                  }
+                  if ([display respondsToSelector:@selector(registerCallbackWithUUID:damageRectanglesCallback:)]) {
+                      [display registerCallbackWithUUID:[NSUUID UUID] damageRectanglesCallback:^(NSArray *_) {
+                        dispatch_async(gEncQueue, ^{
+                          gDirty = YES;
+                          encodeNow();
+                        });
+                      }];
+                  }
+                  // Safety net: the seed check makes this free when nothing changed.
+                  dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gEncQueue);
+                  dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, NSEC_PER_SEC / 30, NSEC_PER_MSEC);
+                  dispatch_source_set_event_handler(timer, ^{
+                    encodeNow();
+                  });
+                  dispatch_resume(timer);
+
+                  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                    char *line = NULL;
+                    size_t cap = 0;
+                    while (getline(&line, &cap, stdin) > 0) {
+                        NSData *d = [NSData dataWithBytes:line length:strlen(line)];
+                        NSDictionary *cmd = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+                        if ([cmd isKindOfClass:[NSDictionary class]]) handleCommand(cmd);
+                    }
+                    exit(0);  // Cortex closed the pipe
+                  });
+                  dispatch_main();
+              }
+          }
+          OBJC
+          (xcrun clang -fobjc-arc -O2 -framework Foundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox -framework IOSurface \
+            -o "$RUNNER_TEMP/simbridge" "$RUNNER_TEMP/simbridge.m" > "$RUNNER_TEMP/simbridge.log" 2>&1 || true) &
           UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for k in sorted(d, reverse=True) if "iOS" in k for x in d[k] if x["name"].startswith("iPhone")))')
           echo "UDID=$UDID" >> "$GITHUB_ENV"
-          xcrun simctl boot "$UDID"
+          # Already booted on a self-hosted Mac that keeps it running: that's fine.
+          xcrun simctl boot "$UDID" 2>/dev/null || true
           xcrun simctl bootstatus "$UDID" -b
       - name: Install your app
         run: |
           APP=$(ls -d app/*.app | head -1)
           xcrun simctl install "$UDID" "$APP"
-          xcrun simctl launch "$UDID" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist" > "$RUNNER_TEMP/app-id"
+          xcrun simctl launch "$UDID" "$(cat "$RUNNER_TEMP/app-id")"
       - name: Share the screen
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,13 +546,31 @@ jobs:
           command -v cloudflared >/dev/null || brew install cloudflared >/dev/null
           nohup npx -y serve-sim@0.1.47 --codec mjpeg > "$RUNNER_TEMP/sim.log" 2>&1 &
           for i in $(seq 1 90); do curl -sf http://127.0.0.1:3200 >/dev/null && break; sleep 2; done
+          cat > "$RUNNER_TEMP/devctl" <<'SH'
+          #!/bin/bash
+          case "$1" in
+            tree)
+              [ -x "$RUNNER_TEMP/simbridge" ] || { echo "the element reader didn't build:"; tail -n 20 "$RUNNER_TEMP/simbridge.log"; } >&2
+              exec "$RUNNER_TEMP/simbridge" --udid "$UDID" --describe ;;
+            launch) xcrun simctl launch "$UDID" "$2" > /dev/null && echo "launched $2" ;;
+            terminate) xcrun simctl terminate "$UDID" "$2" > /dev/null 2>&1; echo "stopped $2" ;;
+            openurl) xcrun simctl openurl "$UDID" "$2" && echo "opened $2" ;;
+            app) cat "$RUNNER_TEMP/app-id" ;;
+            *) echo "unknown action" >&2; exit 2 ;;
+          esac
+          SH
+          chmod +x "$RUNNER_TEMP/devctl"
           cat > "$RUNNER_TEMP/proxy.js" <<'JS'
           const http = require("http");
           const net = require("net");
           const crypto = require("crypto");
+          const { execFile } = require("child_process");
           const HASH = process.env.CORTEX_KEY_HASH;
           const UDID = process.env.UDID;
           const TARGET = Number(process.env.SIM_PORT || 3200);
+          // The device's own controls (its element tree, start or stop the app, open a link), run by a script.
+          const CTL = process.env.DEVICE_CTL;
+          const CtlOps = ["launch", "terminate", "openurl", "app"];
           const sha = (s) => crypto.createHash("sha256").update(s).digest("hex");
           // A page anyone with the session link can open in a browser: the screen, touch,
           // the Home button and typing (the same calls Cortex's own panel makes).
@@ -101,7 +611,7 @@ jobs:
             const u = new URL(rawUrl, "http://proxy");
             const key = u.searchParams.get("k") || "";
             const okKey = key.length > 0 && crypto.timingSafeEqual(Buffer.from(sha(key)), Buffer.from(HASH));
-            const okPath = u.pathname === "/cortex/info" || u.pathname === "/cortex/view" || u.pathname.startsWith("/helper/" + UDID + "/");
+            const okPath = ["/cortex/info", "/cortex/view", "/cortex/tree", "/cortex/app"].includes(u.pathname) || u.pathname.startsWith("/helper/" + UDID + "/");
             u.searchParams.delete("k");
             return { ok: okKey && okPath, u };
           }
@@ -121,6 +631,24 @@ jobs:
             if (u.pathname === "/cortex/view") {
               res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
               res.end(VIEW_HTML);
+              return;
+            }
+            if (u.pathname === "/cortex/tree" || u.pathname === "/cortex/app") {
+              if (!CTL) { res.writeHead(404, cors); res.end("not available on this device"); return; }
+              let args = ["tree"];
+              if (u.pathname === "/cortex/app") {
+                const op = u.searchParams.get("op") || "";
+                const arg = u.searchParams.get("arg") || "";
+                // Arguments reach a device shell, so only app ids and plain links get through.
+                const okArg = op === "app" || (op === "openurl" ? /^[A-Za-z][A-Za-z0-9+.-]*:[^\s'"\x60$\\;&|<>(){}]+$/.test(arg) : /^[A-Za-z0-9._-]+$/.test(arg));
+                if (!CtlOps.includes(op) || !okArg) { res.writeHead(400, cors); res.end("bad request"); return; }
+                args = [op, arg];
+              }
+              execFile(CTL, args, { timeout: 60000, maxBuffer: 32 << 20 }, (err, out, errOut) => {
+                if (err) { res.writeHead(500, { ...cors, "Content-Type": "text/plain" }); res.end(String(errOut || err.message).slice(-2000)); return; }
+                res.writeHead(200, { ...cors, "Content-Type": "text/plain; charset=utf-8" });
+                res.end(out);
+              });
               return;
             }
             if (u.pathname === "/cortex/info") {
@@ -157,7 +685,7 @@ jobs:
           });
           server.listen(Number(process.env.PROXY_PORT || 3300), "127.0.0.1");
           JS
-          nohup node "$RUNNER_TEMP/proxy.js" > "$RUNNER_TEMP/proxy.log" 2>&1 &
+          DEVICE_CTL="$RUNNER_TEMP/devctl" nohup node "$RUNNER_TEMP/proxy.js" > "$RUNNER_TEMP/proxy.log" 2>&1 &
           nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:3300 > "$RUNNER_TEMP/cf.log" 2>&1 &
           for i in $(seq 1 45); do URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$RUNNER_TEMP/cf.log" | head -1); [ -n "$URL" ] && break; sleep 2; done
           [ -n "$URL" ] || { cat "$RUNNER_TEMP/cf.log"; echo "::error::The tunnel did not start"; exit 1; }
