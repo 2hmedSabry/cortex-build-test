@@ -1,4 +1,4 @@
-# cortex-simulator v2 serve-sim=0.1.47
+# cortex-simulator v4 serve-sim=0.1.47
 # Made by Cortex. Opens an iPhone simulator with one of your test builds and streams it to Cortex.
 name: Cortex Simulator
 run-name: Cortex iPhone simulator for build ${{ inputs.run_id }}
@@ -31,22 +31,27 @@ jobs:
           run-id: ${{ inputs.run_id }}
           github-token: ${{ github.token }}
           path: app
-      - name: Start the simulator with the app
+      - name: Start the iPhone
         run: |
+          # The streaming tools download while the iPhone boots (the boot takes minutes).
+          (brew install cloudflared >/dev/null 2>&1; npm cache add serve-sim@0.1.47 >/dev/null 2>&1; touch "$RUNNER_TEMP/tools-ready") &
           UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for k in sorted(d, reverse=True) if "iOS" in k for x in d[k] if x["name"].startswith("iPhone")))')
           echo "UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID"
           xcrun simctl bootstatus "$UDID" -b
+      - name: Install your app
+        run: |
           APP=$(ls -d app/*.app | head -1)
           xcrun simctl install "$UDID" "$APP"
           xcrun simctl launch "$UDID" "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
-      - name: Stream it to Cortex
+      - name: Share the screen
         env:
           GH_TOKEN: ${{ github.token }}
           CORTEX_KEY_HASH: ${{ inputs.key_hash }}
         run: |
           case "$CORTEX_KEY_HASH" in *[!0-9a-f]*|"") echo "::error::bad key_hash"; exit 1;; esac
-          brew install cloudflared >/dev/null
+          for i in $(seq 1 120); do [ -f "$RUNNER_TEMP/tools-ready" ] && break; sleep 2; done
+          command -v cloudflared >/dev/null || brew install cloudflared >/dev/null
           nohup npx -y serve-sim@0.1.47 --codec mjpeg > "$RUNNER_TEMP/sim.log" 2>&1 &
           for i in $(seq 1 90); do curl -sf http://127.0.0.1:3200 >/dev/null && break; sleep 2; done
           cat > "$RUNNER_TEMP/proxy.js" <<'JS'
@@ -57,11 +62,46 @@ jobs:
           const UDID = process.env.UDID;
           const TARGET = Number(process.env.SIM_PORT || 3200);
           const sha = (s) => crypto.createHash("sha256").update(s).digest("hex");
+          // A page anyone with the session link can open in a browser: the screen, touch,
+          // the Home button and typing (the same calls Cortex's own panel makes).
+          const VIEW_HTML = [
+            "<!doctype html><html><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>",
+            "<title>iPhone simulator</title><style>",
+            "html,body{margin:0;height:100%;background:#0b0f14;color:#9aa4b2;font:13px -apple-system,Segoe UI,sans-serif}",
+            "#w{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px}",
+            "#s{max-height:88vh;max-width:96vw;border-radius:22px;touch-action:none;cursor:pointer;background:#000}",
+            "button{background:#1b2230;color:#e6e6e6;border:1px solid #2c3647;border-radius:6px;padding:6px 12px;cursor:pointer}",
+            "</style></head><body><div id=w><img id=s draggable=false alt=''><div><button id=h>Home</button> ",
+            "<span>Shared from Cortex. Click the screen to type.</span></div></div><script>",
+            "var k=new URLSearchParams(location.search).get('k')||'';",
+            "function usage(c){if(c=='Enter')return[40,0];if(c=='Backspace')return[42,0];if(c==' ')return[44,0];",
+            "if(c.length!=1)return null;var l=c.toLowerCase();if(l>='a'&&l<='z')return[4+l.charCodeAt(0)-97,c!=l?1:0];",
+            "if(c>='1'&&c<='9')return[30+c.charCodeAt(0)-49,0];if(c=='0')return[39,0];",
+            "var p={'-':[45,0],'.':[55,0],',':[54,0],'/':[56,0],'@':[31,1],'?':[56,1],'!':[30,1]};return p[c]||null}",
+            "fetch('/cortex/info?k='+encodeURIComponent(k)).then(function(r){return r.json()}).then(function(i){",
+            "var u='/helper/'+i.udid,img=document.getElementById('s');",
+            "img.src=u+'/stream.mjpeg?k='+encodeURIComponent(k);",
+            "var ws=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host+u+'/ws?k='+encodeURIComponent(k));",
+            "ws.binaryType='arraybuffer';",
+            "function send(t,o){var b=new TextEncoder().encode(JSON.stringify(o)),m=new Uint8Array(b.length+1);m[0]=t;m.set(b,1);if(ws.readyState==1)ws.send(m)}",
+            "function pt(e){var r=img.getBoundingClientRect(),w=img.naturalWidth,h=img.naturalHeight;if(!w)return null;",
+            "var s=Math.min(r.width/w,r.height/h),dw=w*s,dh=h*s,x=(e.clientX-r.left-(r.width-dw)/2)/dw,y=(e.clientY-r.top-(r.height-dh)/2)/dh;",
+            "return x<0||x>1||y<0||y>1?null:{x:x,y:y}}",
+            "var down=false;",
+            "img.onpointerdown=function(e){var p=pt(e);if(!p)return;down=true;img.setPointerCapture(e.pointerId);send(3,{type:'begin',x:p.x,y:p.y})};",
+            "img.onpointermove=function(e){if(!down)return;var p=pt(e);if(p)send(3,{type:'move',x:p.x,y:p.y})};",
+            "img.onpointerup=function(e){if(!down)return;down=false;var p=pt(e)||{x:.5,y:.5};send(3,{type:'end',x:p.x,y:p.y})};",
+            "document.getElementById('h').onclick=function(){send(4,{button:'home'})};",
+            "document.onkeydown=function(e){var c=usage(e.key);if(!c||e.metaKey||e.ctrlKey)return;e.preventDefault();",
+            "if(c[1])send(6,{type:'down',usage:225});send(6,{type:'down',usage:c[0]});send(6,{type:'up',usage:c[0]});if(c[1])send(6,{type:'up',usage:225})};",
+            "});</script></body></html>",
+          ].join("");
+
           function check(rawUrl) {
             const u = new URL(rawUrl, "http://proxy");
             const key = u.searchParams.get("k") || "";
             const okKey = key.length > 0 && crypto.timingSafeEqual(Buffer.from(sha(key)), Buffer.from(HASH));
-            const okPath = u.pathname === "/cortex/info" || u.pathname.startsWith("/helper/" + UDID + "/");
+            const okPath = u.pathname === "/cortex/info" || u.pathname === "/cortex/view" || u.pathname.startsWith("/helper/" + UDID + "/");
             u.searchParams.delete("k");
             return { ok: okKey && okPath, u };
           }
@@ -78,6 +118,11 @@ jobs:
           const server = http.createServer((req, res) => {
             const { ok, u } = check(req.url);
             if (!ok) { res.writeHead(403, cors); res.end("forbidden"); return; }
+            if (u.pathname === "/cortex/view") {
+              res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+              res.end(VIEW_HTML);
+              return;
+            }
             if (u.pathname === "/cortex/info") {
               res.writeHead(200, { ...cors, "Content-Type": "application/json" });
               res.end(JSON.stringify({ udid: UDID }));
