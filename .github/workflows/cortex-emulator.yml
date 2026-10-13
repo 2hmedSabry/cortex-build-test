@@ -1,4 +1,4 @@
-# cortex-emulator v3 api=34
+# cortex-emulator v4 api=34
 # Made by Cortex. Opens an Android emulator with one of your test builds and streams it to Cortex.
 name: Cortex Emulator
 run-name: Cortex Android emulator for build ${{ inputs.run_id }}
@@ -58,6 +58,7 @@ jobs:
           adb install -r "$APK"
           BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
           PKG=$("$BT/aapt2" dump packagename "$APK")
+          echo "$PKG" > "$RUNNER_TEMP/app-id"
           adb shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1 > /dev/null
       - name: Share the screen
         env:
@@ -212,13 +213,33 @@ jobs:
           server.listen(PORT, "127.0.0.1");
           JS
           nohup env DEVICE=android node "$RUNNER_TEMP/emu.js" > "$RUNNER_TEMP/emu.log" 2>&1 &
+          cat > "$RUNNER_TEMP/devctl" <<'SH'
+          #!/bin/bash
+          ADB="$ANDROID_HOME/platform-tools/adb"
+          case "$1" in
+            tree)
+              echo "size $("$ADB" shell wm size | grep -o '[0-9]*x[0-9]*' | tail -1)"
+              "$ADB" exec-out uiautomator dump /dev/tty ;;
+            launch) "$ADB" shell monkey -p "$2" -c android.intent.category.LAUNCHER 1 > /dev/null && echo "launched $2" ;;
+            terminate) "$ADB" shell am force-stop "$2" && echo "stopped $2" ;;
+            # adb joins the arguments into one device command; the proxy only lets plain links through.
+            openurl) "$ADB" shell am start -a android.intent.action.VIEW -d "'$2'" > /dev/null && echo "opened $2" ;;
+            app) cat "$RUNNER_TEMP/app-id" ;;
+            *) echo "unknown action" >&2; exit 2 ;;
+          esac
+          SH
+          chmod +x "$RUNNER_TEMP/devctl"
           cat > "$RUNNER_TEMP/proxy.js" <<'JS'
           const http = require("http");
           const net = require("net");
           const crypto = require("crypto");
+          const { execFile } = require("child_process");
           const HASH = process.env.CORTEX_KEY_HASH;
           const UDID = process.env.UDID;
           const TARGET = Number(process.env.SIM_PORT || 3200);
+          // The device's own controls (its element tree, start or stop the app, open a link), run by a script.
+          const CTL = process.env.DEVICE_CTL;
+          const CtlOps = ["launch", "terminate", "openurl", "app"];
           const sha = (s) => crypto.createHash("sha256").update(s).digest("hex");
           // A page anyone with the session link can open in a browser: the screen, touch,
           // the Home button and typing (the same calls Cortex's own panel makes).
@@ -259,7 +280,7 @@ jobs:
             const u = new URL(rawUrl, "http://proxy");
             const key = u.searchParams.get("k") || "";
             const okKey = key.length > 0 && crypto.timingSafeEqual(Buffer.from(sha(key)), Buffer.from(HASH));
-            const okPath = u.pathname === "/cortex/info" || u.pathname === "/cortex/view" || u.pathname.startsWith("/helper/" + UDID + "/");
+            const okPath = ["/cortex/info", "/cortex/view", "/cortex/tree", "/cortex/app"].includes(u.pathname) || u.pathname.startsWith("/helper/" + UDID + "/");
             u.searchParams.delete("k");
             return { ok: okKey && okPath, u };
           }
@@ -279,6 +300,24 @@ jobs:
             if (u.pathname === "/cortex/view") {
               res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
               res.end(VIEW_HTML);
+              return;
+            }
+            if (u.pathname === "/cortex/tree" || u.pathname === "/cortex/app") {
+              if (!CTL) { res.writeHead(404, cors); res.end("not available on this device"); return; }
+              let args = ["tree"];
+              if (u.pathname === "/cortex/app") {
+                const op = u.searchParams.get("op") || "";
+                const arg = u.searchParams.get("arg") || "";
+                // Arguments reach a device shell, so only app ids and plain links get through.
+                const okArg = op === "app" || (op === "openurl" ? /^[A-Za-z][A-Za-z0-9+.-]*:[^\s'"\x60$\\;&|<>(){}]+$/.test(arg) : /^[A-Za-z0-9._-]+$/.test(arg));
+                if (!CtlOps.includes(op) || !okArg) { res.writeHead(400, cors); res.end("bad request"); return; }
+                args = [op, arg];
+              }
+              execFile(CTL, args, { timeout: 60000, maxBuffer: 32 << 20 }, (err, out, errOut) => {
+                if (err) { res.writeHead(500, { ...cors, "Content-Type": "text/plain" }); res.end(String(errOut || err.message).slice(-2000)); return; }
+                res.writeHead(200, { ...cors, "Content-Type": "text/plain; charset=utf-8" });
+                res.end(out);
+              });
               return;
             }
             if (u.pathname === "/cortex/info") {
@@ -315,7 +354,7 @@ jobs:
           });
           server.listen(Number(process.env.PROXY_PORT || 3300), "127.0.0.1");
           JS
-          nohup node "$RUNNER_TEMP/proxy.js" > "$RUNNER_TEMP/proxy.log" 2>&1 &
+          DEVICE_CTL="$RUNNER_TEMP/devctl" nohup node "$RUNNER_TEMP/proxy.js" > "$RUNNER_TEMP/proxy.log" 2>&1 &
           nohup cloudflared tunnel --no-autoupdate --url http://127.0.0.1:3300 > "$RUNNER_TEMP/cf.log" 2>&1 &
           for i in $(seq 1 45); do URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$RUNNER_TEMP/cf.log" | head -1); [ -n "$URL" ] && break; sleep 2; done
           [ -n "$URL" ] || { cat "$RUNNER_TEMP/cf.log"; echo "::error::The tunnel did not start"; exit 1; }
