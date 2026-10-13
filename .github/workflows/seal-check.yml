@@ -1,0 +1,9 @@
+name: Seal check
+on: workflow_dispatch
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          V: ${{ secrets.CORTEX_SEAL_CHECK }}
+        run: '[ "$V" = "cortex-seal-ok-42" ] && echo SEAL_OK || { echo SEAL_BAD; exit 1; }'
