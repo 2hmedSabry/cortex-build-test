@@ -1,4 +1,4 @@
-# cortex-emulator v4 api=34
+# cortex-emulator v6 api=34
 # Made by Cortex. Opens an Android emulator with one of your test builds and streams it to Cortex.
 name: Cortex Emulator
 run-name: Cortex Android emulator for build ${{ inputs.run_id }}
@@ -308,13 +308,13 @@ jobs:
               if (u.pathname === "/cortex/app") {
                 const op = u.searchParams.get("op") || "";
                 const arg = u.searchParams.get("arg") || "";
-                // Arguments reach a device shell, so only app ids and plain links get through.
-                const okArg = op === "app" || (op === "openurl" ? /^[A-Za-z][A-Za-z0-9+.-]*:[^\s'"\x60$\\;&|<>(){}]+$/.test(arg) : /^[A-Za-z0-9._-]+$/.test(arg));
+                // Arguments reach a device shell (inside single quotes), so only app ids and links without quotes or shell characters get through.
+                const okArg = op === "app" || (op === "openurl" ? /^[A-Za-z][A-Za-z0-9+.-]*:[^\s'"\x60$\\;|<>(){}]+$/.test(arg) : /^[A-Za-z0-9._-]+$/.test(arg));
                 if (!CtlOps.includes(op) || !okArg) { res.writeHead(400, cors); res.end("bad request"); return; }
                 args = [op, arg];
               }
               execFile(CTL, args, { timeout: 60000, maxBuffer: 32 << 20 }, (err, out, errOut) => {
-                if (err) { res.writeHead(500, { ...cors, "Content-Type": "text/plain" }); res.end(String(errOut || err.message).slice(-2000)); return; }
+                if (err) { res.writeHead(500, { ...cors, "Content-Type": "text/plain" }); res.end(String(errOut || out || err.message).slice(-2000)); return; }
                 res.writeHead(200, { ...cors, "Content-Type": "text/plain; charset=utf-8" });
                 res.end(out);
               });
@@ -375,4 +375,4 @@ jobs:
         run: |
           gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=success -f context="cortex/simulator/$GITHUB_RUN_ID" \
             -f description="Android emulator closed" >/dev/null || true
-          tail -n 40 "$RUNNER_TEMP/emu.log" 2>/dev/null || true
+          for f in emu proxy cf; do [ -f "$RUNNER_TEMP/$f.log" ] && { echo "--- $f.log"; tail -n 40 "$RUNNER_TEMP/$f.log"; }; done; true
