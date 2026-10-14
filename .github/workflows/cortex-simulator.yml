@@ -1,4 +1,4 @@
-# cortex-simulator v8 serve-sim=0.1.47 bridge=147b83d6
+# cortex-simulator v9 serve-sim=0.1.47 bridge=147b83d6
 # Made by Cortex. Opens an iPhone simulator with one of your test builds and streams it to Cortex.
 name: Cortex Simulator
 run-name: Cortex iPhone simulator for build ${{ inputs.run_id }}
@@ -640,8 +640,8 @@ jobs:
               if (u.pathname === "/cortex/app") {
                 const op = u.searchParams.get("op") || "";
                 const arg = u.searchParams.get("arg") || "";
-                // Arguments reach a device shell, so only app ids and plain links get through.
-                const okArg = op === "app" || (op === "openurl" ? /^[A-Za-z][A-Za-z0-9+.-]*:[^\s'"\x60$\\;&|<>(){}]+$/.test(arg) : /^[A-Za-z0-9._-]+$/.test(arg));
+                // Arguments reach a device shell (inside single quotes), so only app ids and links without quotes or shell characters get through.
+                const okArg = op === "app" || (op === "openurl" ? /^[A-Za-z][A-Za-z0-9+.-]*:[^\s'"\x60$\\;|<>(){}]+$/.test(arg) : /^[A-Za-z0-9._-]+$/.test(arg));
                 if (!CtlOps.includes(op) || !okArg) { res.writeHead(400, cors); res.end("bad request"); return; }
                 args = [op, arg];
               }
